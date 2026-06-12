@@ -55,25 +55,18 @@ def is_base64_image(s):
     return False
 
 def load_image(path_or_base64):
-    """支持本地路径（仅限安全目录内）或 base64 编码图片"""
-    # 优先检查是否为 base64
-    if is_base64_image(path_or_base64):
-        if ',' in path_or_base64:
-            base64_str = path_or_base64.split(',')[1]
-        else:
-            base64_str = path_or_base64
-        image_data = base64.b64decode(base64_str)
-        return Image.open(BytesIO(image_data))
+    # 如果是 base64 则处理
+    if path_or_base64.startswith('data:image') or (len(path_or_base64) > 100 and not os.path.exists(path_or_base64)):
+        # ... base64 解析代码 ...
+        pass
     else:
-        # 本地路径：必须位于允许的目录内（防止路径遍历）
-        input_path = Path(path_or_base64).resolve()
-        allowed_dirs = [UPLOAD_FOLDER.resolve(), OUTPUT_FOLDER.resolve()]
-        # 检查是否在允许目录内
-        if not any(str(input_path).startswith(str(d)) for d in allowed_dirs):
-            raise ValueError(f"禁止访问路径: {path_or_base64}")
-        if not input_path.exists():
-            raise FileNotFoundError(f"文件不存在: {path_or_base64}")
-        return Image.open(input_path)
+        # 直接尝试打开，不提前检查路径合法性
+        try:
+            return Image.open(path_or_base64)
+        except FileNotFoundError:
+            raise Exception(f"文件不存在: {path_or_base64}")
+        except Exception as e:
+            raise Exception(f"无法加载图片: {str(e)}")
 
 def save_image_base64(image, format='PNG'):
     """将PIL图像保存为base64字符串"""
