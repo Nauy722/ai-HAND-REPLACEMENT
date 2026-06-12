@@ -52,35 +52,19 @@ def is_base64_image(s):
     return False
 
 def load_image(source):
-    """支持本地路径、HTTP URL 和 Base64 字符串"""
-    # 1. 处理 HTTP/HTTPS URL
+    # ... 其他处理 ...
     if isinstance(source, str) and (source.startswith('http://') or source.startswith('https://')):
         try:
-            resp = requests.get(source, timeout=15)
+            # 增加请求头模拟浏览器，避免被拒
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            resp = requests.get(source, timeout=15, headers=headers, allow_redirects=True)
             resp.raise_for_status()
             return Image.open(BytesIO(resp.content))
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             raise Exception(f"从URL下载图片失败: {str(e)}")
-
-    # 2. 处理 Base64
-    if isinstance(source, str) and (source.startswith('data:image') or is_base64_image(source)):
-        try:
-            if ',' in source:
-                base64_str = source.split(',')[1]
-            else:
-                base64_str = source
-            image_data = base64.b64decode(base64_str)
-            return Image.open(BytesIO(image_data))
-        except Exception as e:
-            raise Exception(f"解析Base64图片失败: {str(e)}")
-
-    # 3. 作为本地文件路径处理
-    try:
-        return Image.open(source)
-    except FileNotFoundError:
-        raise Exception(f"文件不存在: {source}")
-    except Exception as e:
-        raise Exception(f"无法加载图片: {str(e)}")
+    # ...
 
 def save_image_to_file(image, filepath, quality=85, fmt=None):
     """将 PIL 图像保存到文件，路径会被限制在 OUTPUT_FOLDER 内"""
