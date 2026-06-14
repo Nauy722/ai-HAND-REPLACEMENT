@@ -1,367 +1,299 @@
-# -*- coding: utf-8 -*-
 import os
+import uuid
 import json
-import base64
 import logging
-import re
+from flask import Flask, request, jsonify, send_from_directory
+from PIL import Image, ImageEnhance, ImageDraw, ImageFont, ImageColor
 import requests
 from io import BytesIO
-from pathlib import Path
-from datetime import datetime
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from PIL import Image, ImageEnhance, ImageDraw, ImageFont
-from werkzeug.utils import secure_filename
 
 # 配置日志
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, origins=["*"])
 
-# 配置目录
-BASE_DIR = Path("/tmp/image_processor")
-UPLOAD_FOLDER = BASE_DIR / "uploads"
-OUTPUT_FOLDER = BASE_DIR / "outputs"
-UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
-OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = str(UPLOAD_FOLDER)
-app.config['OUTPUT_FOLDER'] = str(OUTPUT_FOLDER)
+# 配置静态文件夹用于存储和提供处理后的图片
+UPLOAD_FOLDER = os.path.join(os.getcwd(), 'static', 'processed')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def is_base64_image(s):
-    if not isinstance(s, str):
-        return False
-    if s.startswith('data:image'):
-        return True
-    s_clean = re.sub(r'\s', '', s)
-    if re.match(r'^[A-Za-z0-9+/]+=*$', s_clean):
-        try:
-            data = base64.b64decode(s_clean)
-            if data.startswith(b'\xff\xd8') or data.startswith(b'GIF') or data.startswith(b'PNG'):
-                return True
-        except:
-            pass
-    return False
-
-def load_image(source):
-    """支持 HTTP/HTTPS URL、Base64 字符串和本地文件路径"""
-    # 1. HTTP/HTTPS URL
-    if isinstance(source, str) and (source.startswith('http://') or source.startswith('https://')):
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            resp = requests.get(source, timeout=15, headers=headers, allow_redirects=True)
-            resp.raise_for_status()
-            return Image.open(BytesIO(resp.content))
-        except Exception as e:
-            raise Exception(f"从URL下载图片失败: {str(e)}")
-
-    # 2. Base64
-    if isinstance(source, str) and (source.startswith('data:image') or is_base64_image(source)):
-        try:
-            if ',' in source:
-                base64_str = source.split(',')[1]
-            else:
-                base64_str = source
-            image_data = base64.b64decode(base64_str)
+# ----------------- 核心图像处理工具类 -----------------
+class ImageProcessor:
+    @staticmethod
+    def download_image(source):
+        """支持下载 URL 图片或解析 Base64"""
+        if not source:
+            raise ValueError("图片源不能为空")
+            
+        # 1. 如果是 URL 链接
+        if source.startswith('http://') or source.startswith('https://'):
+            logger.info(f"正在从网络下载图片: {source[:60]}...")
+            response = requests.get(source, timeout=15)
+            response.raise_for_status()
+            return Image.open(BytesIO(response.content))
+            
+        # 2. 如果是 Base64 格式
+        elif source.startswith('data:image') or ';base64,' in source:
+            logger.info("正在解析 Base64 格式图片...")
+            import base64
+            header, encoded = source.split(',', 1)
+            image_data = base64.b64decode(encoded)
             return Image.open(BytesIO(image_data))
-        except Exception as e:
-            raise Exception(f"解析Base64图片失败: {str(e)}")
+            
+        else:
+            raise ValueError("不支持的图片源格式 (必须是 http/https 链接或 Base64)")
 
-    # 3. 本地文件路径
-    try:
-        return Image.open(source)
-    except FileNotFoundError:
-        raise Exception(f"文件不存在: {source}")
-    except Exception as e:
-        raise Exception(f"无法加载图片: {str(e)}")
+    @staticmethod
+    def apply_crop(img, params):
+        """裁剪处理: 支持 auto_center_square, auto, [x, y, w, h]"""
+        width, height = img.size
+        box = params.get("box", "auto")
+        aspect_ratio = params.get("aspect_ratio", "free")
+        
+        # 1. 智能居中正方形裁剪
+        if box == "auto_center_square" or aspect_ratio == "1:1":
+            min_edge = min(width, height)
+            left = (width - min_edge) // 2
+            top = (height - min_edge) // 2
+            right = left + min_edge
+            bottom = top + min_edge
+            logger.info(f"执行中心正方形裁剪: {(left, top, right, bottom)}")
+            return img.crop((left, top, right, bottom))
+            
+        # 2. 指定区域裁剪 (防御性解析，防止非整型崩溃)
+        elif isinstance(box, list) and len(box) == 4:
+            try:
+                coords = [int(float(x)) for x in box]
+                # 边界约束，防止越界报错
+                coords[0] = max(0, min(coords[0], width))
+                coords[1] = max(0, min(coords[1], height))
+                coords[2] = max(coords[0] + 1, min(coords[2], width))
+                coords[3] = max(coords[1] + 1, min(coords[3], height))
+                logger.info(f"执行指定区域裁剪: {coords}")
+                return img.crop(tuple(coords))
+            except Exception as e:
+                logger.warning(f"解析裁剪坐标失败, 跳过裁剪: {e}")
+                
+        # 3. 默认不裁剪或自动处理
+        return img
 
-def save_image_to_file(image, filepath, quality=85, fmt=None):
-    """将 PIL 图像保存到文件，路径限制在 OUTPUT_FOLDER 内"""
-    filepath = Path(filepath).resolve()
-    if not str(filepath).startswith(str(OUTPUT_FOLDER.resolve())):
-        raise ValueError(f"保存路径必须在 {OUTPUT_FOLDER} 内")
-    filepath.parent.mkdir(parents=True, exist_ok=True)
+    @staticmethod
+    def apply_tone(img, params):
+        """色调调整: 亮度、对比度、冷暖滤镜"""
+        # 1. 调整亮度
+        brightness = params.get("brightness", 1.0)
+        if brightness != 1.0:
+            try:
+                enhancer = ImageEnhance.Brightness(img)
+                img = enhancer.enhance(float(brightness))
+                logger.info(f"调整亮度: {brightness}")
+            except Exception as e:
+                logger.error(f"亮度调整失败: {e}")
 
-    if fmt is None:
-        fmt = filepath.suffix[1:].upper() if filepath.suffix else 'PNG'
-    else:
-        fmt = fmt.upper()
+        # 2. 调整对比度
+        contrast = params.get("contrast", 1.0)
+        if contrast != 1.0:
+            try:
+                enhancer = ImageEnhance.Contrast(img)
+                img = enhancer.enhance(float(contrast))
+                logger.info(f"调整对比度: {contrast}")
+            except Exception as e:
+                logger.error(f"对比度调整失败: {e}")
 
-    save_img = image
-    if fmt in ('JPEG', 'JPG') and image.mode in ('RGBA', 'LA', 'P'):
-        save_img = image.convert('RGB')
+        # 3. 冷暖滤镜处理
+        filter_type = params.get("filter", "none")
+        if filter_type != "none":
+            # 转换为 RGB 进行色彩通道微调
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            r, g, b = img.split()
+            
+            if filter_type == "auto_warm":
+                # 暖色调：稍微增加红、绿通道的值
+                r = r.point(lambda i: min(255, int(i * 1.1)))
+                g = g.point(lambda i: min(255, int(i * 1.05)))
+                logger.info("应用暖色调滤镜")
+            elif filter_type == "auto_cool":
+                # 冷色调：稍微增加蓝、绿通道的值
+                b = b.point(lambda i: min(255, int(i * 1.1)))
+                g = g.point(lambda i: min(255, int(i * 1.05)))
+                logger.info("应用冷色调滤镜")
+                
+            img = Image.merge('RGB', (r, g, b))
+            
+        return img
 
-    save_kwargs = {'format': fmt}
-    if fmt in ('JPEG', 'JPG'):
-        save_kwargs['quality'] = quality
-    save_img.save(filepath, **save_kwargs)
+    @staticmethod
+    def apply_watermark(img, params):
+        """批量添加文本水印"""
+        text = params.get("text", "")
+        if not text:
+            return img
+            
+        position = params.get("position", "bottom_right")
+        opacity = params.get("opacity", 0.5)
+        
+        # 转换至 RGBA 模式以支持透明度
+        txt_layer = Image.new('RGBA', img.size, (255, 255, 255, 0))
+        
+        # 尝试加载默认字体，如果失败则使用系统基础字体
+        try:
+            # 选用较大的字体
+            font_size = max(15, min(img.size) // 25)
+            font = ImageFont.load_default() # 在Linux环境下基础字体
+        except Exception:
+            font = ImageFont.load_default()
+            
+        draw = ImageDraw.Draw(txt_layer)
+        width, height = img.size
+        
+        # 简易文本长宽估算
+        text_w = len(text) * 12
+        text_h = 20
+        
+        # 计算水印坐标
+        if position == "bottom_right":
+            x, y = width - text_w - 20, height - text_h - 20
+        elif position == "center":
+            x, y = (width - text_w) // 2, (height - text_h) // 2
+        elif position == "top_left":
+            x, y = 20, 20
+        else:
+            x, y = width - text_w - 20, height - text_h - 20
+            
+        # 绘制带透明度的半透明白色文字水印
+        fill_color = (255, 255, 255, int(float(opacity) * 255))
+        draw.text((x, y), text, fill=fill_color, font=font)
+        
+        # 复合层
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+            
+        combined = Image.alpha_composite(img, txt_layer)
+        return combined.convert('RGB') if img.mode != 'RGBA' else combined
 
-def save_image_base64(image, fmt='PNG'):
-    """将 PIL 图像保存为 base64 字符串"""
-    buffer = BytesIO()
-    if fmt.upper() == 'JPEG' and image.mode in ('RGBA', 'LA', 'P'):
-        image = image.convert('RGB')
-    image.save(buffer, format=fmt)
-    base64_str = base64.b64encode(buffer.getvalue()).decode('utf-8')
-    return f"data:image/{fmt.lower()};base64,{base64_str}"
+
+# ----------------- API 路由 -----------------
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok", "message": "Visual Work Automation Agent is Running!"})
 
 @app.route('/api/execute', methods=['POST'])
-def execute():
+def execute_task():
+    """
+    统一的图像自动化处理执行入口 (代替原来的 /api/merge)
+    """
     try:
         data = request.get_json()
         if not data:
-            return jsonify({"status": "error", "message": "缺少请求体"}), 400
-
-        atomic_ops = data.get('atomic_ops', [])
-        if not atomic_ops:
-            return jsonify({"status": "error", "message": "atomic_ops 不能为空"}), 400
-
-        image = None
-        result = {"status": "success", "outputs": []}
-
-        for op in atomic_ops:
-            action = op.get('action')
-            if action == 'load_image':
-                path = op.get('path')
-                if not path:
-                    return jsonify({"status": "error", "message": "load_image 缺少 path"}), 400
-                image = load_image(path)
-                logger.info(f"Loaded image from {path}")
-
-            elif action == 'resize':
-                if image is None:
-                    return jsonify({"status": "error", "message": "请先加载图片"}), 400
-                orig_w, orig_h = image.size
-                width = op.get('width')
-                height = op.get('height')
-                keep_ratio = op.get('keep_ratio', True)
-
-                if width is not None and height is not None:
-                    if keep_ratio:
-                        ratio = min(width / orig_w, height / orig_h)
-                        new_w = int(orig_w * ratio)
-                        new_h = int(orig_h * ratio)
-                    else:
-                        new_w, new_h = width, height
-                elif width is not None:
-                    if keep_ratio:
-                        ratio = width / orig_w
-                        new_w = width
-                        new_h = int(orig_h * ratio)
-                    else:
-                        new_w = width
-                        new_h = orig_h
-                elif height is not None:
-                    if keep_ratio:
-                        ratio = height / orig_h
-                        new_h = height
-                        new_w = int(orig_w * ratio)
-                    else:
-                        new_w = orig_w
-                        new_h = height
-                else:
-                    new_w, new_h = orig_w, orig_h
-
-                if new_w > 0 and new_h > 0:
-                    image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                    logger.info(f"Resized image to {image.size}")
-
-            elif action == 'crop':
-                if image is None:
-                    return jsonify({"status": "error", "message": "请先加载图片"}), 400
-                box = op.get('box')
-                # 自动正方形裁剪
-                if box == "auto_square":
-                    w, h = image.size
-                    side = min(w, h)
-                    left = (w - side) // 2
-                    top = (h - side) // 2
-                    box = [left, top, left + side, top + side]
-                # 兼容字符串列表
-                elif isinstance(box, str):
+            return jsonify({"error": "请求体不能为空 (JSON)"}), 400
+            
+        image_sources = data.get("images", [])
+        params_json_str = data.get("params", "[]")
+        
+        # 兼容性设计：如果 params 直接是 List/Dict 而不是字符串
+        if isinstance(params_json_str, str):
+            operations = json.loads(params_json_str)
+        else:
+            operations = params_json_str
+            
+        if not image_sources:
+            return jsonify({"error": "待处理的 'images' 列表不能为空"}), 400
+            
+        logger.info(f"接收到批量任务，待处理图片数: {len(image_sources)}, 操作列表: {operations}")
+        
+        processed_urls = []
+        host_url = request.host_url  # 自动获取当前 Railway 部署的外部公网根域名
+        
+        # 循环批处理每一张图片
+        for idx, src in enumerate(image_sources):
+            try:
+                # 1. 下载或解析
+                img = ImageProcessor.download_image(src)
+                original_format = img.format if img.format else "JPEG"
+                
+                target_format = original_format
+                compress_quality = 85
+                max_size_kb = None
+                
+                # 2. 依次应用大模型提取的操作序列
+                for op in operations:
+                    op_type = op.get("type")
+                    op_params = op.get("params", {})
+                    
+                    if op_type == "crop":
+                        img = ImageProcessor.apply_crop(img, op_params)
+                    elif op_type == "tone":
+                        img = ImageProcessor.apply_tone(img, op_params)
+                    elif op_type == "watermark":
+                        img = ImageProcessor.apply_watermark(img, op_params)
+                    elif op_type == "convert":
+                        target_format = op_params.get("target_format", original_format).upper()
+                        if target_format == "JPG":
+                            target_format = "JPEG"
+                    elif op_type == "compress":
+                        compress_quality = int(op_params.get("quality", 85))
+                        max_size_kb = op_params.get("max_size_kb")
+                        
+                # 3. 统一规范图像色彩模式 (防止 PNG 透明通道保存为 JPG 时报错)
+                if target_format == "JPEG" and img.mode in ('RGBA', 'LA'):
+                    img = img.convert('RGB')
+                    
+                # 4. 生成唯一文件名，保存到 Railway 静态托管目录
+                ext = "jpg" if target_format == "JPEG" else target_format.lower()
+                filename = f"processed_{uuid.uuid4().hex}.{ext}"
+                filepath = os.path.join(UPLOAD_FOLDER, filename)
+                
+                # 保存图片 (同时应用质量压缩)
+                img.save(filepath, format=target_format, quality=compress_quality)
+                
+                # 5. 可选：如果设置了 max_size_kb，则进行动态二分法质量压缩
+                if max_size_kb:
                     try:
-                        box = json.loads(box)
-                    except:
-                        box = [int(x.strip()) for x in box.split(',') if x.strip()]
-                if not isinstance(box, list) or len(box) != 4:
-                    return jsonify({"status": "error", "message": "crop 需要 box 参数 [left,top,right,bottom]"}), 400
-                try:
-                    box = [int(v) for v in box]
-                except ValueError:
-                    return jsonify({"status": "error", "message": "box 元素必须为整数"}), 400
-                image = image.crop(box)
-                logger.info(f"Cropped image to {image.size}")
-
-            elif action == 'adjust_color':
-                if image is None:
-                    return jsonify({"status": "error", "message": "请先加载图片"}), 400
-                temperature = op.get('temperature')  # 'warm' or 'cool'
-                if temperature == 'warm':
-                    # 简单暖色：增加R,G通道
-                    r, g, b = image.split()
-                    r = r.point(lambda i: i * 1.2)
-                    g = g.point(lambda i: i * 1.1)
-                    image = Image.merge('RGB', (r, g, b))
-                elif temperature == 'cool':
-                    r, g, b = image.split()
-                    b = b.point(lambda i: i * 1.2)
-                    g = g.point(lambda i: i * 1.1)
-                    image = Image.merge('RGB', (r, g, b))
-                else:
-                    # 默认暖色
-                    r, g, b = image.split()
-                    r = r.point(lambda i: i * 1.1)
-                    image = Image.merge('RGB', (r, g, b))
-                logger.info(f"Adjusted color temperature to {temperature}")
-
-            elif action == 'add_watermark':
-                if image is None:
-                    return jsonify({"status": "error", "message": "请先加载图片"}), 400
-                text = op.get('text', 'AI手替')
-                position = op.get('position', 'bottom-right')
-                opacity = op.get('opacity', 0.6)
-
-                # 转换为 RGBA 以支持透明度
-                if image.mode != 'RGBA':
-                    image = image.convert('RGBA')
-                watermark = Image.new('RGBA', image.size, (0,0,0,0))
-                draw = ImageDraw.Draw(watermark)
-
-                # 尝试加载字体，若无则使用默认
-                font = None
-                try:
-                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
-                except:
-                    try:
-                        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 36)
-                    except:
-                        font = ImageFont.load_default()
-
-                bbox = draw.textbbox((0,0), text, font=font)
-                text_w = bbox[2] - bbox[0]
-                text_h = bbox[3] - bbox[1]
-                if position == 'bottom-right':
-                    xy = (image.width - text_w - 20, image.height - text_h - 20)
-                elif position == 'top-left':
-                    xy = (20, 20)
-                else:  # bottom-center
-                    xy = (image.width//2 - text_w//2, image.height - text_h - 20)
-
-                draw.text(xy, text, fill=(255,255,255,int(255*opacity)), font=font)
-                # 合成
-                image = Image.alpha_composite(image, watermark).convert('RGB')
-                logger.info(f"Added watermark '{text}' at {position}")
-
-            elif action == 'save_image':
-                if image is None:
-                    return jsonify({"status": "error", "message": "请先处理图片"}), 400
-                path = op.get('path')
-                quality = op.get('quality', 85)
-                fmt = op.get('format', None)
-
-                if path and isinstance(path, str) and path.strip():
-                    try:
-                        save_image_to_file(image, path, quality, fmt)
-                    except ValueError as e:
-                        return jsonify({"status": "error", "message": str(e)}), 400
-                    result["outputs"].append({"type": "file", "path": str(Path(path).resolve())})
-                else:
-                    final_fmt = fmt if fmt else (image.format if image.format else 'PNG')
-                    b64 = save_image_base64(image, final_fmt)
-                    result["outputs"].append({"type": "base64", "data": b64})
-                logger.info(f"Saved image to {path if path else 'base64'}")
-
-            else:
-                return jsonify({"status": "error", "message": f"未知操作: {action}"}), 400
-
-        return jsonify(result), 200
-
+                        max_size_bytes = int(max_size_kb) * 1024
+                        current_size = os.path.getsize(filepath)
+                        temp_quality = compress_quality
+                        
+                        # 如果文件超标，逐步下调质量直至达标
+                        while current_size > max_size_bytes and temp_quality > 10:
+                            temp_quality -= 10
+                            img.save(filepath, format=target_format, quality=temp_quality)
+                            current_size = os.path.getsize(filepath)
+                            
+                        logger.info(f"像素压缩完成，最终大小: {current_size/1024:.1f} KB, 质量因子: {temp_quality}")
+                    except Exception as ce:
+                        logger.error(f"执行大小压缩目标失败: {ce}")
+                
+                # 6. 生成公网绝对访问 URL
+                # 例如: https://your-railway.up.railway.app/static/processed/processed_xxx.jpg
+                public_url = f"{host_url.rstrip('/')}/static/processed/{filename}"
+                processed_urls.append(public_url)
+                logger.info(f"第 {idx+1} 张图片处理成功并保存为: {public_url}")
+                
+            except Exception as item_error:
+                logger.error(f"处理第 {idx+1} 张图片时发生错误: {item_error}")
+                # 异常容错处理：单张失败不卡死整个批处理流
+                continue
+                
+        return jsonify({
+            "status": "success",
+            "processed_images": processed_urls,
+            "count": len(processed_urls)
+        })
+        
     except Exception as e:
-        logger.exception("执行失败")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        logger.error(f"执行 API 时发生严重异常: {e}")
+        return jsonify({"error": f"服务器内部错误: {str(e)}"}), 500
 
+# 兼容路由：防止扣子工作流中旧的“拼图 (merge)”节点未完全改名导致异常
 @app.route('/api/merge', methods=['POST'])
-def merge_images():
-    """将多张 base64 图片拼接成网格（排版统一）"""
-    try:
-        data = request.get_json()
-        images_b64 = data.get('images', [])
-        cols = data.get('cols', 2)
-        rows = data.get('rows', None)
-        thumb_size = data.get('thumb_size', 300)
-
-        if not images_b64:
-            return jsonify({"error": "没有提供图片"}), 400
-
-        # 解码并缩放所有图片
-        imgs = []
-        for b64 in images_b64:
-            if ',' in b64:
-                b64 = b64.split(',')[1]
-            img_data = base64.b64decode(b64)
-            img = Image.open(BytesIO(img_data))
-            img.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
-            imgs.append(img)
-
-        n = len(imgs)
-        if rows is None:
-            rows = (n + cols - 1) // cols
-
-        # 计算每个单元格的尺寸（取各图最大宽高，使排列整齐）
-        cell_w = max(img.width for img in imgs)
-        cell_h = max(img.height for img in imgs)
-        canvas_w = cell_w * cols
-        canvas_h = cell_h * rows
-        merged = Image.new('RGB', (canvas_w, canvas_h), (255,255,255))
-
-        for idx, img in enumerate(imgs):
-            if idx >= cols * rows:
-                break
-            x = (idx % cols) * cell_w
-            y = (idx // cols) * cell_h
-            # 居中放置
-            offset_x = (cell_w - img.width) // 2
-            offset_y = (cell_h - img.height) // 2
-            merged.paste(img, (x + offset_x, y + offset_y))
-
-        # 转为 base64 返回
-        buff = BytesIO()
-        merged.save(buff, format='PNG')
-        merged_b64 = base64.b64encode(buff.getvalue()).decode()
-        return jsonify({"merged_base64": f"data:image/png;base64,{merged_b64}"})
-
-    except Exception as e:
-        logger.exception("拼图失败")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/health', methods=['GET'])
-def health():
-    return jsonify({"status": "ok"}), 200
-
-@app.route('/api/upload', methods=['POST'])
-def upload():
-    """安全上传图片文件"""
-    if 'file' not in request.files:
-        return jsonify({"status": "error", "message": "没有文件"}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"status": "error", "message": "文件名为空"}), 400
-    if not allowed_file(file.filename):
-        return jsonify({"status": "error", "message": "不支持的文件类型"}), 400
-
-    safe_name = secure_filename(file.filename)
-    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-    unique_name = f"{timestamp}_{safe_name}"
-    save_path = UPLOAD_FOLDER / unique_name
-    file.save(str(save_path))
-    return jsonify({"status": "success", "path": str(save_path)}), 200
+def legacy_merge():
+    logger.info("捕获到历史 /api/merge 节点调用，自动路由至通用执行器")
+    return execute_task()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    # 绑定 0.0.0.0 和 Railway 提供的 PORT 环境变量
+    port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
