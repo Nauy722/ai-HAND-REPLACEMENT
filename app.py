@@ -10,7 +10,7 @@ from pathlib import Path
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageDraw, ImageFont
 from werkzeug.utils import secure_filename
 
 # 配置日志
@@ -39,12 +39,10 @@ def is_base64_image(s):
         return False
     if s.startswith('data:image'):
         return True
-    # 去掉空白后匹配 base64 字符集（标准）
     s_clean = re.sub(r'\s', '', s)
     if re.match(r'^[A-Za-z0-9+/]+=*$', s_clean):
         try:
             data = base64.b64decode(s_clean)
-            # 简单检查图片文件头
             if data.startswith(b'\xff\xd8') or data.startswith(b'GIF') or data.startswith(b'PNG'):
                 return True
         except:
@@ -52,35 +50,49 @@ def is_base64_image(s):
     return False
 
 def load_image(source):
-    # ... 其他处理 ...
+    """支持 HTTP/HTTPS URL、Base64 字符串和本地文件路径"""
+    # 1. HTTP/HTTPS URL
     if isinstance(source, str) and (source.startswith('http://') or source.startswith('https://')):
         try:
-            # 增加请求头模拟浏览器，避免被拒
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
             resp = requests.get(source, timeout=15, headers=headers, allow_redirects=True)
             resp.raise_for_status()
             return Image.open(BytesIO(resp.content))
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             raise Exception(f"从URL下载图片失败: {str(e)}")
-    # ...
+
+    # 2. Base64
+    if isinstance(source, str) and (source.startswith('data:image') or is_base64_image(source)):
+        try:
+            if ',' in source:
+                base64_str = source.split(',')[1]
+            else:
+                base64_str = source
+            image_data = base64.b64decode(base64_str)
+            return Image.open(BytesIO(image_data))
+        except Exception as e:
+            raise Exception(f"解析Base64图片失败: {str(e)}")
+
+    # 3. 本地文件路径
+    try:
+        return Image.open(source)
+    except FileNotFoundError:
+        raise Exception(f"文件不存在: {source}")
+    except Exception as e:
+        raise Exception(f"无法加载图片: {str(e)}")
 
 def save_image_to_file(image, filepath, quality=85, fmt=None):
-    """将 PIL 图像保存到文件，路径会被限制在 OUTPUT_FOLDER 内"""
+    """将 PIL 图像保存到文件，路径限制在 OUTPUT_FOLDER 内"""
     filepath = Path(filepath).resolve()
-    # 限制输出目录必须在 OUTPUT_FOLDER 内
     if not str(filepath).startswith(str(OUTPUT_FOLDER.resolve())):
         raise ValueError(f"保存路径必须在 {OUTPUT_FOLDER} 内")
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
-    # 确定保存格式
     if fmt is None:
         fmt = filepath.suffix[1:].upper() if filepath.suffix else 'PNG'
     else:
         fmt = fmt.upper()
 
-    # 处理模式转换
     save_img = image
     if fmt in ('JPEG', 'JPG') and image.mode in ('RGBA', 'LA', 'P'):
         save_img = image.convert('RGB')
@@ -93,7 +105,6 @@ def save_image_to_file(image, filepath, quality=85, fmt=None):
 def save_image_base64(image, fmt='PNG'):
     """将 PIL 图像保存为 base64 字符串"""
     buffer = BytesIO()
-    # 若保存为 JPEG 且图像含 alpha 通道，转为 RGB
     if fmt.upper() == 'JPEG' and image.mode in ('RGBA', 'LA', 'P'):
         image = image.convert('RGB')
     image.save(buffer, format=fmt)
@@ -165,19 +176,87 @@ def execute():
                 if image is None:
                     return jsonify({"status": "error", "message": "请先加载图片"}), 400
                 box = op.get('box')
-                if not box or len(box) != 4:
+                # 自动正方形裁剪
+                if box == "auto_square":
+                    w, h = image.size
+                    side = min(w, h)
+                    left = (w - side) // 2
+                    top = (h - side) // 2
+                    box = [left, top, left + side, top + side]
+                # 兼容字符串列表
+                elif isinstance(box, str):
+                    try:
+                        box = json.loads(box)
+                    except:
+                        box = [int(x.strip()) for x in box.split(',') if x.strip()]
+                if not isinstance(box, list) or len(box) != 4:
                     return jsonify({"status": "error", "message": "crop 需要 box 参数 [left,top,right,bottom]"}), 400
-                box = [int(v) for v in box]
+                try:
+                    box = [int(v) for v in box]
+                except ValueError:
+                    return jsonify({"status": "error", "message": "box 元素必须为整数"}), 400
                 image = image.crop(box)
                 logger.info(f"Cropped image to {image.size}")
 
-            elif action == 'adjust_brightness':
+            elif action == 'adjust_color':
                 if image is None:
                     return jsonify({"status": "error", "message": "请先加载图片"}), 400
-                factor = float(op.get('factor', 1.0))
-                enhancer = ImageEnhance.Brightness(image)
-                image = enhancer.enhance(factor)
-                logger.info(f"Adjusted brightness with factor {factor}")
+                temperature = op.get('temperature')  # 'warm' or 'cool'
+                if temperature == 'warm':
+                    # 简单暖色：增加R,G通道
+                    r, g, b = image.split()
+                    r = r.point(lambda i: i * 1.2)
+                    g = g.point(lambda i: i * 1.1)
+                    image = Image.merge('RGB', (r, g, b))
+                elif temperature == 'cool':
+                    r, g, b = image.split()
+                    b = b.point(lambda i: i * 1.2)
+                    g = g.point(lambda i: i * 1.1)
+                    image = Image.merge('RGB', (r, g, b))
+                else:
+                    # 默认暖色
+                    r, g, b = image.split()
+                    r = r.point(lambda i: i * 1.1)
+                    image = Image.merge('RGB', (r, g, b))
+                logger.info(f"Adjusted color temperature to {temperature}")
+
+            elif action == 'add_watermark':
+                if image is None:
+                    return jsonify({"status": "error", "message": "请先加载图片"}), 400
+                text = op.get('text', 'AI手替')
+                position = op.get('position', 'bottom-right')
+                opacity = op.get('opacity', 0.6)
+
+                # 转换为 RGBA 以支持透明度
+                if image.mode != 'RGBA':
+                    image = image.convert('RGBA')
+                watermark = Image.new('RGBA', image.size, (0,0,0,0))
+                draw = ImageDraw.Draw(watermark)
+
+                # 尝试加载字体，若无则使用默认
+                font = None
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
+                except:
+                    try:
+                        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 36)
+                    except:
+                        font = ImageFont.load_default()
+
+                bbox = draw.textbbox((0,0), text, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+                if position == 'bottom-right':
+                    xy = (image.width - text_w - 20, image.height - text_h - 20)
+                elif position == 'top-left':
+                    xy = (20, 20)
+                else:  # bottom-center
+                    xy = (image.width//2 - text_w//2, image.height - text_h - 20)
+
+                draw.text(xy, text, fill=(255,255,255,int(255*opacity)), font=font)
+                # 合成
+                image = Image.alpha_composite(image, watermark).convert('RGB')
+                logger.info(f"Added watermark '{text}' at {position}")
 
             elif action == 'save_image':
                 if image is None:
@@ -187,14 +266,12 @@ def execute():
                 fmt = op.get('format', None)
 
                 if path and isinstance(path, str) and path.strip():
-                    # 保存到文件
                     try:
                         save_image_to_file(image, path, quality, fmt)
                     except ValueError as e:
                         return jsonify({"status": "error", "message": str(e)}), 400
                     result["outputs"].append({"type": "file", "path": str(Path(path).resolve())})
                 else:
-                    # 返回 base64
                     final_fmt = fmt if fmt else (image.format if image.format else 'PNG')
                     b64 = save_image_base64(image, final_fmt)
                     result["outputs"].append({"type": "base64", "data": b64})
@@ -208,6 +285,60 @@ def execute():
     except Exception as e:
         logger.exception("执行失败")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/merge', methods=['POST'])
+def merge_images():
+    """将多张 base64 图片拼接成网格（排版统一）"""
+    try:
+        data = request.get_json()
+        images_b64 = data.get('images', [])
+        cols = data.get('cols', 2)
+        rows = data.get('rows', None)
+        thumb_size = data.get('thumb_size', 300)
+
+        if not images_b64:
+            return jsonify({"error": "没有提供图片"}), 400
+
+        # 解码并缩放所有图片
+        imgs = []
+        for b64 in images_b64:
+            if ',' in b64:
+                b64 = b64.split(',')[1]
+            img_data = base64.b64decode(b64)
+            img = Image.open(BytesIO(img_data))
+            img.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
+            imgs.append(img)
+
+        n = len(imgs)
+        if rows is None:
+            rows = (n + cols - 1) // cols
+
+        # 计算每个单元格的尺寸（取各图最大宽高，使排列整齐）
+        cell_w = max(img.width for img in imgs)
+        cell_h = max(img.height for img in imgs)
+        canvas_w = cell_w * cols
+        canvas_h = cell_h * rows
+        merged = Image.new('RGB', (canvas_w, canvas_h), (255,255,255))
+
+        for idx, img in enumerate(imgs):
+            if idx >= cols * rows:
+                break
+            x = (idx % cols) * cell_w
+            y = (idx // cols) * cell_h
+            # 居中放置
+            offset_x = (cell_w - img.width) // 2
+            offset_y = (cell_h - img.height) // 2
+            merged.paste(img, (x + offset_x, y + offset_y))
+
+        # 转为 base64 返回
+        buff = BytesIO()
+        merged.save(buff, format='PNG')
+        merged_b64 = base64.b64encode(buff.getvalue()).decode()
+        return jsonify({"merged_base64": f"data:image/png;base64,{merged_b64}"})
+
+    except Exception as e:
+        logger.exception("拼图失败")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/health', methods=['GET'])
 def health():
