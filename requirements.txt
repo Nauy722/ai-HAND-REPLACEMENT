@@ -1,7 +1,4 @@
 Flask==3.0.2
 Pillow==10.2.0
-requests==2.31.0
 gunicorn==21.2.0
-3. **`Procfile`**（告诉 Railway 容器如何启动服务，建议使用生产级 WSGI 容器 `gunicorn`）：
-```text
-web: gunicorn app:app
+requests==2.31.0
