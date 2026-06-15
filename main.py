@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 import io
 import base64
 
@@ -16,6 +16,11 @@ class Operation(BaseModel):
     position: Optional[str] = "bottom-right"
     ratio: Optional[str] = None
     maintain_aspect: Optional[bool] = False
+    # 色调调节参数，全部可选
+    brightness: Optional[float] = None
+    contrast: Optional[float] = None
+    saturation: Optional[float] = None
+    sharpness: Optional[float] = None
 
 class ProcessRequest(BaseModel):
     images: List[str]
@@ -71,9 +76,23 @@ def apply_operations(img: Image.Image, ops: List[Operation]) -> Image.Image:
                 xy = (margin, margin)
             else:
                 xy = (img.width - tw - margin, img.height - th - margin)
-            # 白色阴影增强可读性
             draw.text((xy[0]+2, xy[1]+2), txt, fill=(0,0,0), font=font)
             draw.text(xy, txt, fill=(255,255,255), font=font)
+
+        elif op.type == "color_adjust":
+            # 按需应用色调调整
+            if op.brightness is not None:
+                enhancer = ImageEnhance.Brightness(img)
+                img = enhancer.enhance(op.brightness)
+            if op.contrast is not None:
+                enhancer = ImageEnhance.Contrast(img)
+                img = enhancer.enhance(op.contrast)
+            if op.saturation is not None:
+                enhancer = ImageEnhance.Color(img)
+                img = enhancer.enhance(op.saturation)
+            if op.sharpness is not None:
+                enhancer = ImageEnhance.Sharpness(img)
+                img = enhancer.enhance(op.sharpness)
 
     return img
 
