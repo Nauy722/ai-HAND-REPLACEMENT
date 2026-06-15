@@ -3,7 +3,7 @@ import uuid
 import json
 import logging
 from flask import Flask, request, jsonify, send_from_directory
-from PIL import Image, ImageEnhance, ImageDraw, ImageFont, ImageColor
+from PIL import Image, ImageEnhance, ImageDraw, ImageFont
 import requests
 from io import BytesIO
 
@@ -16,6 +16,19 @@ app = Flask(__name__)
 # 配置静态文件夹用于存储和提供处理后的图片
 UPLOAD_FOLDER = os.path.join(os.getcwd(), 'static', 'processed')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# 尝试加载中文字体（如果存在），否则使用默认字体
+FONT_PATH = os.path.join(os.getcwd(), 'static', 'fonts', 'SimHei.ttf')  # 可自行上传字体文件
+try:
+    if os.path.exists(FONT_PATH):
+        WATERMARK_FONT = ImageFont.truetype(FONT_PATH, 24)
+        logger.info("中文字体加载成功")
+    else:
+        WATERMARK_FONT = ImageFont.load_default()
+        logger.warning("未找到中文字体，将使用默认字体（可能无法显示中文）")
+except Exception as e:
+    WATERMARK_FONT = ImageFont.load_default()
+    logger.warning(f"字体加载失败: {e}，使用默认字体")
 
 # ----------------- 核心图像处理工具类 -----------------
 class ImageProcessor:
@@ -103,18 +116,15 @@ class ImageProcessor:
         # 3. 冷暖滤镜处理
         filter_type = params.get("filter", "none")
         if filter_type != "none":
-            # 转换为 RGB 进行色彩通道微调
             if img.mode != 'RGB':
                 img = img.convert('RGB')
             r, g, b = img.split()
             
             if filter_type == "auto_warm":
-                # 暖色调：稍微增加红、绿通道的值
                 r = r.point(lambda i: min(255, int(i * 1.1)))
                 g = g.point(lambda i: min(255, int(i * 1.05)))
                 logger.info("应用暖色调滤镜")
             elif filter_type == "auto_cool":
-                # 冷色调：稍微增加蓝、绿通道的值
                 b = b.point(lambda i: min(255, int(i * 1.1)))
                 g = g.point(lambda i: min(255, int(i * 1.05)))
                 logger.info("应用冷色调滤镜")
@@ -125,7 +135,7 @@ class ImageProcessor:
 
     @staticmethod
     def apply_watermark(img, params):
-        """批量添加文本水印"""
+        """添加文本水印（支持中文）"""
         text = params.get("text", "")
         if not text:
             return img
@@ -133,44 +143,64 @@ class ImageProcessor:
         position = params.get("position", "bottom_right")
         opacity = params.get("opacity", 0.5)
         
-        # 转换至 RGBA 模式以支持透明度
-        txt_layer = Image.new('RGBA', img.size, (255, 255, 255, 0))
+        # 转换为 RGBA 以支持透明度
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
         
-        # 尝试加载默认字体，如果失败则使用系统基础字体
-        try:
-            # 选用较大的字体
-            font_size = max(15, min(img.size) // 25)
-            font = ImageFont.load_default() # 在Linux环境下基础字体
-        except Exception:
-            font = ImageFont.load_default()
-            
+        txt_layer = Image.new('RGBA', img.size, (255, 255, 255, 0))
         draw = ImageDraw.Draw(txt_layer)
         width, height = img.size
         
-        # 简易文本长宽估算
-        text_w = len(text) * 12
-        text_h = 20
+        # 动态计算字体大小
+        font_size = max(16, min(width, height) // 25)
+        try:
+            # 尝试调整字体大小
+            font = ImageFont.truetype(FONT_PATH, font_size) if os.path.exists(FONT_PATH) else WATERMARK_FONT
+        except:
+            font = WATERMARK_FONT
+        
+        # 估算文字尺寸（粗略但有效）
+        try:
+            # 使用 getsize 方法（PIL 旧版）或 textbbox（新版）
+            if hasattr(draw, 'textbbox'):
+                bbox = draw.textbbox((0, 0), text, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+            else:
+                text_w, text_h = draw.textsize(text, font=font)
+        except:
+            text_w, text_h = len(text) * font_size // 2, font_size
         
         # 计算水印坐标
+        padding = 20
         if position == "bottom_right":
-            x, y = width - text_w - 20, height - text_h - 20
+            x = width - text_w - padding
+            y = height - text_h - padding
         elif position == "center":
-            x, y = (width - text_w) // 2, (height - text_h) // 2
+            x = (width - text_w) // 2
+            y = (height - text_h) // 2
         elif position == "top_left":
-            x, y = 20, 20
+            x = padding
+            y = padding
         else:
-            x, y = width - text_w - 20, height - text_h - 20
-            
-        # 绘制带透明度的半透明白色文字水印
-        fill_color = (255, 255, 255, int(float(opacity) * 255))
+            x = width - text_w - padding
+            y = height - text_h - padding
+        
+        # 绘制半透明白色文字
+        fill_color = (255, 255, 255, int(255 * opacity))
         draw.text((x, y), text, fill=fill_color, font=font)
         
-        # 复合层
-        if img.mode != 'RGBA':
-            img = img.convert('RGBA')
-            
+        # 合并图层
         combined = Image.alpha_composite(img, txt_layer)
-        return combined.convert('RGB') if img.mode != 'RGBA' else combined
+        return combined
+
+    @staticmethod
+    def close_image(img):
+        """安全关闭 PIL Image 对象，释放内存"""
+        try:
+            img.close()
+        except:
+            pass
 
 
 # ----------------- API 路由 -----------------
@@ -179,37 +209,46 @@ class ImageProcessor:
 def health():
     return jsonify({"status": "ok", "message": "Visual Work Automation Agent is Running!"})
 
+@app.route('/static/processed/<path:filename>')
+def serve_processed_image(filename):
+    """提供处理后的图片静态访问"""
+    return send_from_directory(UPLOAD_FOLDER, filename)
+
 @app.route('/api/execute', methods=['POST'])
 def execute_task():
     """
-    统一的图像自动化处理执行入口 (代替原来的 /api/merge)
+    统一的图像自动化处理执行入口
+    兼容前端字段名: image_urls / operations
+    也保留旧版 images / params 以向后兼容
     """
+    img = None  # 用于确保 finally 中关闭
     try:
         data = request.get_json()
         if not data:
             return jsonify({"error": "请求体不能为空 (JSON)"}), 400
-            
-        image_sources = data.get("images", [])
-        params_json_str = data.get("params", "[]")
         
-        # 兼容性设计：如果 params 直接是 List/Dict 而不是字符串
-        if isinstance(params_json_str, str):
-            operations = json.loads(params_json_str)
-        else:
-            operations = params_json_str
-            
+        # 兼容两种字段名：优先使用前端标准字段
+        image_sources = data.get("image_urls") or data.get("images", [])
+        operations = data.get("operations") or data.get("params", [])
+        
+        # 如果 operations 是字符串（旧版），则解析为列表
+        if isinstance(operations, str):
+            try:
+                operations = json.loads(operations)
+            except json.JSONDecodeError:
+                operations = []
+        
         if not image_sources:
-            return jsonify({"error": "待处理的 'images' 列表不能为空"}), 400
-            
+            return jsonify({"error": "待处理的 'image_urls' 或 'images' 列表不能为空"}), 400
+        
         logger.info(f"接收到批量任务，待处理图片数: {len(image_sources)}, 操作列表: {operations}")
         
         processed_urls = []
-        host_url = request.host_url  # 自动获取当前 Railway 部署的外部公网根域名
+        host_url = request.host_url
         
-        # 循环批处理每一张图片
         for idx, src in enumerate(image_sources):
             try:
-                # 1. 下载或解析
+                # 下载图片
                 img = ImageProcessor.download_image(src)
                 original_format = img.format if img.format else "JPEG"
                 
@@ -217,7 +256,7 @@ def execute_task():
                 compress_quality = 85
                 max_size_kb = None
                 
-                # 2. 依次应用大模型提取的操作序列
+                # 依次应用操作
                 for op in operations:
                     op_type = op.get("type")
                     op_params = op.get("params", {})
@@ -235,47 +274,49 @@ def execute_task():
                     elif op_type == "compress":
                         compress_quality = int(op_params.get("quality", 85))
                         max_size_kb = op_params.get("max_size_kb")
-                        
-                # 3. 统一规范图像色彩模式 (防止 PNG 透明通道保存为 JPG 时报错)
+                
+                # 格式兼容处理
                 if target_format == "JPEG" and img.mode in ('RGBA', 'LA'):
                     img = img.convert('RGB')
-                    
-                # 4. 生成唯一文件名，保存到 Railway 静态托管目录
+                
+                # 保存文件
                 ext = "jpg" if target_format == "JPEG" else target_format.lower()
                 filename = f"processed_{uuid.uuid4().hex}.{ext}"
                 filepath = os.path.join(UPLOAD_FOLDER, filename)
                 
-                # 保存图片 (同时应用质量压缩)
                 img.save(filepath, format=target_format, quality=compress_quality)
                 
-                # 5. 可选：如果设置了 max_size_kb，则进行动态二分法质量压缩
+                # 动态压缩到指定大小
                 if max_size_kb:
                     try:
                         max_size_bytes = int(max_size_kb) * 1024
                         current_size = os.path.getsize(filepath)
                         temp_quality = compress_quality
-                        
-                        # 如果文件超标，逐步下调质量直至达标
                         while current_size > max_size_bytes and temp_quality > 10:
                             temp_quality -= 10
                             img.save(filepath, format=target_format, quality=temp_quality)
                             current_size = os.path.getsize(filepath)
-                            
-                        logger.info(f"像素压缩完成，最终大小: {current_size/1024:.1f} KB, 质量因子: {temp_quality}")
+                        logger.info(f"压缩完成，最终大小: {current_size/1024:.1f} KB")
                     except Exception as ce:
-                        logger.error(f"执行大小压缩目标失败: {ce}")
+                        logger.error(f"压缩失败: {ce}")
                 
-                # 6. 生成公网绝对访问 URL
-                # 例如: https://your-railway.up.railway.app/static/processed/processed_xxx.jpg
+                # 生成公网 URL
                 public_url = f"{host_url.rstrip('/')}/static/processed/{filename}"
                 processed_urls.append(public_url)
-                logger.info(f"第 {idx+1} 张图片处理成功并保存为: {public_url}")
+                logger.info(f"第 {idx+1} 张图片处理成功: {public_url}")
+                
+                # 关闭图片对象，释放内存
+                ImageProcessor.close_image(img)
+                img = None
                 
             except Exception as item_error:
                 logger.error(f"处理第 {idx+1} 张图片时发生错误: {item_error}")
-                # 异常容错处理：单张失败不卡死整个批处理流
+                # 确保关闭异常情况下的图片对象
+                if img:
+                    ImageProcessor.close_image(img)
+                    img = None
                 continue
-                
+        
         return jsonify({
             "status": "success",
             "processed_images": processed_urls,
@@ -285,15 +326,18 @@ def execute_task():
     except Exception as e:
         logger.error(f"执行 API 时发生严重异常: {e}")
         return jsonify({"error": f"服务器内部错误: {str(e)}"}), 500
+    finally:
+        # 最终保障：如果还有未关闭的图片对象，关闭它
+        if img:
+            ImageProcessor.close_image(img)
 
-# 兼容路由：防止扣子工作流中旧的“拼图 (merge)”节点未完全改名导致异常
 @app.route('/api/merge', methods=['POST'])
 def legacy_merge():
+    """兼容旧版 /api/merge 路由"""
     logger.info("捕获到历史 /api/merge 节点调用，自动路由至通用执行器")
     return execute_task()
 
+
 if __name__ == '__main__':
-    # 绑定 0.0.0.0 和 Railway 提供的 PORT 环境变量
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
